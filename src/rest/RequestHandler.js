@@ -7,6 +7,14 @@ const {
   browser,
 } = require('../util/Constants');
 const Util = require('../util/Util');
+const redis = require("redis");
+
+const client = redis.createClient();
+
+
+client.on('connect', function() {
+  console.log('RequestHander connected redis');
+});
 
 function parseResponse(res) {
   if (res.headers.get('content-type').startsWith('application/json')) return res.json();
@@ -87,6 +95,7 @@ class RequestHandler {
           path: request.path,
           route: request.route,
         });
+        client.decr("global-rate-limit-count");
       }
 
       if (this.manager.globalTimeout) {
@@ -96,84 +105,167 @@ class RequestHandler {
         await Util.delayFor(timeout);
       }
     }
-
+    
     // Perform the request
     let res;
     try {
-      res = await request.make();
+      // descrease the global bucket counter
+      client.decr('counter', async (err, reply) => {
+  
+        if (reply <= 0) {
+          setTimeout(async () => {
+            res = await request.make();
+            console.log("entered setTimeout for reply<=0")         
+
+            if (res && res.headers) {
+              const serverDate = res.headers.get('date');
+              const limit = res.headers.get('x-ratelimit-limit');
+              const remaining = res.headers.get('x-ratelimit-remaining');
+              const reset = res.headers.get('x-ratelimit-reset');
+              const retryAfter = res.headers.get('retry-after');
+        
+              this.limit = limit ? Number(limit) : Infinity;
+              this.remaining = remaining ? Number(remaining) : 1;
+              this.reset = reset ? calculateReset(reset, serverDate) : Date.now();
+              this.retryAfter = retryAfter ? Number(retryAfter) : -1;
+        
+              // https://github.com/discordapp/discord-api-docs/issues/182
+              if (item.request.route.includes('reactions')) {
+                this.reset = new Date(serverDate).getTime() - getAPIOffset(serverDate) + 250;
+              }
+        
+              // Handle global ratelimit
+              if (res.headers.get('x-ratelimit-global')) {
+                // Set the manager's global timeout as the promise for other requests to "wait"
+                this.manager.globalTimeout = Util.delayFor(this.retryAfter);
+        
+                // Wait for the global timeout to resolve before continuing
+                await this.manager.globalTimeout;
+        
+                // Clean up global timeout
+                this.manager.globalTimeout = null;
+              }
+            }
+        
+            // Finished handling headers, safe to unlock manager
+            this.busy = false;
+        
+            if (res.ok) {
+              const success = await parseResponse(res);
+              // Nothing wrong with the request, proceed with the next one
+              resolve(success);
+              return this.run();
+            } else if (res.status === 429) {
+              // A ratelimit was hit - this should never happen
+              this.queue.unshift(item);
+              this.manager.client.emit('debug', `429 hit on route ${item.request.route}`);
+              await Util.delayFor(this.retryAfter);
+              return this.run();
+            } else if (res.status >= 500 && res.status < 600) {
+              // Retry the specified number of times for possible serverside issues
+              if (item.retries === this.manager.client.options.retryLimit) {
+                return reject(
+                  new HTTPError(res.statusText, res.constructor.name, res.status, item.request.method, request.path),
+                );
+              } else {
+                item.retries++;
+                this.queue.unshift(item);
+                return this.run();
+              }
+            } else {
+              // Handle possible malformed requests
+              try {
+                const data = await parseResponse(res);
+                if (res.status >= 400 && res.status < 500) {
+                  return reject(new DiscordAPIError(request.path, data, request.method, res.status));
+                }
+                return null;
+              } catch (err) {
+                return reject(new HTTPError(err.message, err.constructor.name, err.status, request.method, request.path));
+              }
+            }
+          }, (this.retryAfter == -1 ? 1500 : this.retryAfter));
+        } else {
+          res = await request.make();      
+          if (res && res.headers) {
+            const serverDate = res.headers.get('date');
+            const limit = res.headers.get('x-ratelimit-limit');
+            const remaining = res.headers.get('x-ratelimit-remaining');
+            const reset = res.headers.get('x-ratelimit-reset');
+            const retryAfter = res.headers.get('retry-after');
+      
+            this.limit = limit ? Number(limit) : Infinity;
+            this.remaining = remaining ? Number(remaining) : 1;
+            this.reset = reset ? calculateReset(reset, serverDate) : Date.now();
+            this.retryAfter = retryAfter ? Number(retryAfter) : -1;
+      
+            // https://github.com/discordapp/discord-api-docs/issues/182
+            if (item.request.route.includes('reactions')) {
+              this.reset = new Date(serverDate).getTime() - getAPIOffset(serverDate) + 250;
+            }
+      
+            // Handle global ratelimit
+            if (res.headers.get('x-ratelimit-global')) {
+              // Set the manager's global timeout as the promise for other requests to "wait"
+              this.manager.globalTimeout = Util.delayFor(this.retryAfter);
+      
+              // Wait for the global timeout to resolve before continuing
+              await this.manager.globalTimeout;
+      
+              // Clean up global timeout
+              this.manager.globalTimeout = null;
+            }
+          }
+      
+          // Finished handling headers, safe to unlock manager
+          this.busy = false;
+      
+          if (res.ok) {
+            const success = await parseResponse(res);
+            // Nothing wrong with the request, proceed with the next one
+            resolve(success);
+            return this.run();
+          } else if (res.status === 429) {
+            // A ratelimit was hit - this should never happen
+            this.queue.unshift(item);
+            this.manager.client.emit('debug', `429 hit on route ${item.request.route}`);
+            await Util.delayFor(this.retryAfter);
+            return this.run();
+          } else if (res.status >= 500 && res.status < 600) {
+            // Retry the specified number of times for possible serverside issues
+            if (item.retries === this.manager.client.options.retryLimit) {
+              return reject(
+                new HTTPError(res.statusText, res.constructor.name, res.status, item.request.method, request.path),
+              );
+            } else {
+              item.retries++;
+              this.queue.unshift(item);
+              return this.run();
+            }
+          } else {
+            // Handle possible malformed requests
+            try {
+              const data = await parseResponse(res);
+              if (res.status >= 400 && res.status < 500) {
+                return reject(new DiscordAPIError(request.path, data, request.method, res.status));
+              }
+              return null;
+            } catch (err) {
+              return reject(new HTTPError(err.message, err.constructor.name, err.status, request.method, request.path));
+            }
+          }
+
+        }  
+      });
+      
+      
     } catch (error) {
       // NodeFetch error expected for all "operational" errors, such as 500 status code
       this.busy = false;
       return reject(new HTTPError(error.message, error.constructor.name, error.status, request.method, request.path));
     }
 
-    if (res && res.headers) {
-      const serverDate = res.headers.get('date');
-      const limit = res.headers.get('x-ratelimit-limit');
-      const remaining = res.headers.get('x-ratelimit-remaining');
-      const reset = res.headers.get('x-ratelimit-reset');
-      const retryAfter = res.headers.get('retry-after');
-
-      this.limit = limit ? Number(limit) : Infinity;
-      this.remaining = remaining ? Number(remaining) : 1;
-      this.reset = reset ? calculateReset(reset, serverDate) : Date.now();
-      this.retryAfter = retryAfter ? Number(retryAfter) : -1;
-
-      // https://github.com/discordapp/discord-api-docs/issues/182
-      if (item.request.route.includes('reactions')) {
-        this.reset = new Date(serverDate).getTime() - getAPIOffset(serverDate) + 250;
-      }
-
-      // Handle global ratelimit
-      if (res.headers.get('x-ratelimit-global')) {
-        // Set the manager's global timeout as the promise for other requests to "wait"
-        this.manager.globalTimeout = Util.delayFor(this.retryAfter);
-
-        // Wait for the global timeout to resolve before continuing
-        await this.manager.globalTimeout;
-
-        // Clean up global timeout
-        this.manager.globalTimeout = null;
-      }
-    }
-
-    // Finished handling headers, safe to unlock manager
-    this.busy = false;
-
-    if (res.ok) {
-      const success = await parseResponse(res);
-      // Nothing wrong with the request, proceed with the next one
-      resolve(success);
-      return this.run();
-    } else if (res.status === 429) {
-      // A ratelimit was hit - this should never happen
-      this.queue.unshift(item);
-      this.manager.client.emit('debug', `429 hit on route ${item.request.route}`);
-      await Util.delayFor(this.retryAfter);
-      return this.run();
-    } else if (res.status >= 500 && res.status < 600) {
-      // Retry the specified number of times for possible serverside issues
-      if (item.retries === this.manager.client.options.retryLimit) {
-        return reject(
-          new HTTPError(res.statusText, res.constructor.name, res.status, item.request.method, request.path),
-        );
-      } else {
-        item.retries++;
-        this.queue.unshift(item);
-        return this.run();
-      }
-    } else {
-      // Handle possible malformed requests
-      try {
-        const data = await parseResponse(res);
-        if (res.status >= 400 && res.status < 500) {
-          return reject(new DiscordAPIError(request.path, data, request.method, res.status));
-        }
-        return null;
-      } catch (err) {
-        return reject(new HTTPError(err.message, err.constructor.name, err.status, request.method, request.path));
-      }
-    }
+    
   }
 }
 
